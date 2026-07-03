@@ -1,0 +1,739 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Collaborative SLAM sim: N drones, environments, MCAP recording</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@2.44.0/dist/tabler-icons.min.css">
+<style>
+:root{
+--surface-1:#1a2233;
+--surface-2:#0f1626;
+--border:#2c374d;
+--text-primary:#e5e7eb;
+--text-secondary:#9aa5b8;
+--text-muted:#6b7688;
+--bg-accent:#1e3a5f;
+--text-accent:#8ec5ff;
+--bg-success:#123a25;
+--text-success:#7fe0a3;
+--radius:8px;
+}
+body{
+background:#0b0f17;
+color:var(--text-primary);
+font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+padding:32px 24px;
+max-width:900px;
+margin:0 auto;
+}
+</style>
+</head>
+<body>
+<h2 class="sr-only">Interactive simulation of a configurable number of drones exploring a chosen floor plan, building a shared occupancy map, then navigating autonomously to a point you click.</h2>
+<style>
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.cs-wrap{display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start}
+.cs-panel{background:var(--surface-1);border:0.5px solid var(--border);border-radius:12px;padding:10px 12px}
+.cs-row{display:flex;justify-content:space-between;align-items:center;font-size:12px;color:var(--text-secondary);margin-bottom:4px}
+.cs-bar{height:6px;border-radius:4px;background:var(--surface-2);overflow:hidden;margin-bottom:8px}
+.cs-fill{height:100%;width:0%}
+.cs-badge{display:inline-block;font-size:12px;font-weight:500;padding:2px 10px;border-radius:999px;background:var(--bg-accent);color:var(--text-accent)}
+.cs-badge.nav{background:var(--bg-success);color:var(--text-success)}
+.cs-badge.rec{background:#5a1e1e;color:#ff9a9a}
+.cs-legend{display:grid;grid-template-columns:1fr 1fr;gap:4px 10px;font-size:11px;color:var(--text-secondary)}
+.cs-legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:middle}
+.cs-log div{font-size:12px;color:var(--text-secondary);padding:3px 0;border-top:0.5px solid var(--border)}
+.cs-log div:first-child{border-top:none}
+.cs-setup{display:flex;gap:14px;align-items:center;flex-wrap:wrap;font-size:12px;color:var(--text-secondary)}
+.cs-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:middle}
+button{background:var(--surface-2);color:var(--text-primary);border:0.5px solid var(--border);border-radius:6px;padding:8px 10px;font-size:13px;cursor:pointer}
+button:hover{background:var(--surface-1)}
+button:disabled{opacity:.4;cursor:not-allowed}
+input[type=range]{accent-color:#7F77DD}
+input[type=number],select{background:var(--surface-2);color:var(--text-primary);border:0.5px solid var(--border);border-radius:6px;padding:4px 6px;font-size:12px}
+</style>
+<div class="cs-setup" style="margin-bottom:10px">
+<label>Drones <input type="number" id="csNumDrones" min="2" max="8" value="2" style="width:52px"></label>
+<label>Environment
+<select id="csEnv"></select>
+</label>
+<span class="cs-badge" id="csPhase">Mapping</span>
+<span class="cs-badge" id="csRecBadge" style="display:none">Recording</span>
+</div>
+<div style="margin-bottom:10px;font-size:12px;color:var(--text-muted)" id="csHint">Drones are exploring independently and will share what they find when close enough.</div>
+<div class="cs-wrap">
+<div>
+<canvas id="csCanvas" style="display:block;border-radius:var(--radius);border:0.5px solid var(--border)"></canvas>
+</div>
+<div style="flex:1;min-width:190px;display:flex;flex-direction:column;gap:10px">
+<div class="cs-panel" id="csCoveragePanel"></div>
+<div class="cs-panel" style="display:flex;flex-direction:column;gap:8px">
+<button id="csPause" style="width:100%"><i class="ti ti-player-pause" aria-hidden="true" style="font-size:16px;vertical-align:-3px;margin-right:4px"></i>Pause</button>
+<button id="csReset" style="width:100%"><i class="ti ti-refresh" aria-hidden="true" style="font-size:16px;vertical-align:-3px;margin-right:4px"></i>Reset</button>
+<button id="csNav" style="width:100%" disabled><i class="ti ti-route" aria-hidden="true" style="font-size:16px;vertical-align:-3px;margin-right:4px"></i>Switch to navigation</button>
+<button id="csRecord" style="width:100%"><i class="ti ti-player-record" aria-hidden="true" style="font-size:16px;vertical-align:-3px;margin-right:4px"></i>Record MCAP</button>
+<label style="font-size:12px;color:var(--text-secondary);display:flex;align-items:center;gap:8px">Speed<input type="range" id="csSpeed" min="0.5" max="3" step="0.5" value="1" style="flex:1"></label>
+</div>
+<div class="cs-panel cs-log" id="csLog"></div>
+<div class="cs-panel cs-legend">
+<div><i style="background:#11151c"></i>Unknown</div>
+<div><i style="background:#1D9E75"></i>Explored</div>
+<div><i style="background:#7F77DD"></i>Shared (2+)</div>
+<div><i style="background:#475569"></i>Wall found</div>
+<div><i style="background:#facc15"></i>Target</div>
+</div>
+</div>
+</div>
+<p style="font-size:12px;color:var(--text-muted);margin-top:12px">Click anywhere on the map once navigation unlocks to send every drone there.</p>
+<script type="module">
+import { McapWriter, TempBuffer } from 'https://cdn.jsdelivr.net/npm/@mcap/core/+esm';
+
+function buildTwoRooms(ROWS,COLS){
+ var g=[];
+ for(var r=0;r<ROWS;r++){ g.push(new Array(COLS).fill(false)); }
+ for(var r=0;r<ROWS;r++){ for(var c=0;c<COLS;c++){ if(r===0||r===ROWS-1||c===0||c===COLS-1) g[r][c]=true; } }
+ var midc=Math.floor(COLS/2);
+ var door=[Math.floor(ROWS/2)-1, Math.floor(ROWS/2)];
+ for(var r=1;r<ROWS-1;r++){ if(door.indexOf(r)===-1) g[r][midc]=true; }
+ var blocks=[[2,3,3,4],[ROWS-5,ROWS-4,6,7],[2,3,midc+3,midc+4],[ROWS-5,ROWS-4,midc+5,midc+6]];
+ blocks.forEach(function(b){ for(var r=b[0];r<=b[1];r++){ for(var c=b[2];c<=b[3];c++){ if(r>0&&r<ROWS-1&&c>0&&c<COLS-1) g[r][c]=true; } } });
+ return g;
+}
+function buildWarehouse(ROWS,COLS){
+ var g=[];
+ for(var r=0;r<ROWS;r++){ g.push(new Array(COLS).fill(false)); }
+ for(var r=0;r<ROWS;r++){ for(var c=0;c<COLS;c++){ if(r===0||r===ROWS-1||c===0||c===COLS-1) g[r][c]=true; } }
+ var blocks=[[2,4,3,5],[2,4,10,12],[2,4,17,19],[7,9,6,8],[7,9,14,16],[11,13,3,5],[11,13,10,12],[11,13,17,19]];
+ blocks.forEach(function(b){ for(var r=b[0];r<=b[1];r++){ for(var c=b[2];c<=b[3];c++){ if(r>0&&r<ROWS-1&&c>0&&c<COLS-1) g[r][c]=true; } } });
+ return g;
+}
+function buildFourRooms(ROWS,COLS){
+ var g=[];
+ for(var r=0;r<ROWS;r++){ g.push(new Array(COLS).fill(false)); }
+ for(var r=0;r<ROWS;r++){ for(var c=0;c<COLS;c++){ if(r===0||r===ROWS-1||c===0||c===COLS-1) g[r][c]=true; } }
+ var midr=Math.floor(ROWS/2);
+ var midc=Math.floor(COLS/2);
+ for(var c=1;c<COLS-1;c++){ g[midr][c]=true; }
+ for(var r=1;r<ROWS-1;r++){ g[r][midc]=true; }
+ var leftDoor=Math.max(1,Math.floor(midc/2));
+ var rightDoor=Math.min(COLS-2,midc+Math.floor((COLS-1-midc)/2));
+ var topDoor=Math.max(1,Math.floor(midr/2));
+ var bottomDoor=Math.min(ROWS-2,midr+Math.floor((ROWS-1-midr)/2));
+ g[midr][leftDoor]=false;
+ g[midr][rightDoor]=false;
+ g[topDoor][midc]=false;
+ g[bottomDoor][midc]=false;
+ return g;
+}
+var ENVIRONMENTS=[
+ {name:'Two rooms', rows:14, cols:20, cell:24, build:buildTwoRooms},
+ {name:'Open warehouse', rows:16, cols:24, cell:22, build:buildWarehouse},
+ {name:'Four rooms', rows:18, cols:24, cell:20, build:buildFourRooms}
+];
+var DRONE_COLORS=['#1D9E75','#D85A30','#7F77DD','#D4537E','#378ADD','#BA7517','#639922','#993556'];
+var SENSOR_RANGE_CELLS=4, RAYS=12, RAYSTEP_FRAC=0.25;
+var COMM_RANGE_CELLS=5;
+var SPEED_CELLS_PER_SEC=2.4;
+
+var canvas=document.getElementById('csCanvas');
+var ctx=canvas.getContext('2d');
+var envSelect=document.getElementById('csEnv');
+var numDronesInput=document.getElementById('csNumDrones');
+var phaseEl=document.getElementById('csPhase');
+var recBadge=document.getElementById('csRecBadge');
+var hintEl=document.getElementById('csHint');
+var coveragePanel=document.getElementById('csCoveragePanel');
+var logEl=document.getElementById('csLog');
+var btnPause=document.getElementById('csPause');
+var btnReset=document.getElementById('csReset');
+var btnNav=document.getElementById('csNav');
+var btnRecord=document.getElementById('csRecord');
+var speedInput=document.getElementById('csSpeed');
+
+ENVIRONMENTS.forEach(function(env,i){
+ var opt=document.createElement('option');
+ opt.value=String(i);
+ opt.textContent=env.name;
+ envSelect.appendChild(opt);
+});
+
+var ROWS,COLS,CELL,wallGrid,totalFree,drones,phase,goal,running,navUnlocked,speedMul,logs,lastTime,pairInRange,simTimeNs;
+var recording=false, mcapWriter=null, tempBuf=null, channelIds=null, seqCounters=null, drainPromise=null, lastPoseLogNs=0;
+
+function inBounds(r,c){ return r>=0&&r<ROWS&&c>=0&&c<COLS; }
+function cellCenter(r,c){ return {x:c*CELL+CELL/2,y:r*CELL+CELL/2}; }
+
+function countFree(g){ var n=0; for(var r=0;r<ROWS;r++){ for(var c=0;c<COLS;c++){ if(!g[r][c]) n++; } } return n; }
+
+function pickStartPositions(g,n){
+ var freeCells=[];
+ for(var r=0;r<ROWS;r++){ for(var c=0;c<COLS;c++){ if(!g[r][c]) freeCells.push({r:r,c:c}); } }
+ if(!freeCells.length) return [];
+ var chosen=[freeCells[Math.floor(freeCells.length/2)]];
+ while(chosen.length<n && chosen.length<freeCells.length){
+  var best=null, bestScore=-1;
+  for(var i=0;i<freeCells.length;i++){
+   var fc=freeCells[i];
+   var already=false;
+   for(var k=0;k<chosen.length;k++){ if(chosen[k].r===fc.r&&chosen[k].c===fc.c){ already=true; break; } }
+   if(already) continue;
+   var minDist=Infinity;
+   for(var k2=0;k2<chosen.length;k2++){
+    var dr=fc.r-chosen[k2].r, dc=fc.c-chosen[k2].c;
+    var d=Math.sqrt(dr*dr+dc*dc);
+    if(d<minDist) minDist=d;
+   }
+   if(minDist>bestScore){ bestScore=minDist; best=fc; }
+  }
+  if(!best) break;
+  chosen.push(best);
+ }
+ return chosen;
+}
+
+function makeKnown(){ var g=[]; for(var r=0;r<ROWS;r++){ g.push(new Array(COLS).fill(-1)); } return g; }
+
+function makeDrone(id,color,r,c){
+ var cc=cellCenter(r,c);
+ return {id:id,color:color,r:r,c:c,x:cc.x,y:cc.y,heading:0,known:makeKnown(),path:[],state:'exploring',targetKey:null,wandering:false,wanderStrikes:0,arrivedLogged:false,lastCoveragePct:-1};
+}
+
+function pushLog(text){
+ logs.unshift(text);
+ if(logs.length>6) logs.pop();
+ logEl.innerHTML='';
+ logs.forEach(function(t){ var d=document.createElement('div'); d.textContent=t; logEl.appendChild(d); });
+ queueMessage('/sim/events', {text:text});
+}
+
+function renderCoveragePanel(){
+ coveragePanel.innerHTML='';
+ drones.forEach(function(d){
+  var row=document.createElement('div');
+  row.className='cs-row';
+  var label=document.createElement('span');
+  label.innerHTML='<span class="cs-dot" style="background:'+d.color+'"></span>Drone '+d.id;
+  var val=document.createElement('span');
+  val.id='csCov_'+d.id;
+  val.textContent='0%';
+  row.appendChild(label); row.appendChild(val);
+  var bar=document.createElement('div'); bar.className='cs-bar';
+  var fill=document.createElement('div'); fill.className='cs-fill'; fill.id='csBar_'+d.id; fill.style.background=d.color;
+  bar.appendChild(fill);
+  coveragePanel.appendChild(row);
+  coveragePanel.appendChild(bar);
+ });
+ var teamRow=document.createElement('div'); teamRow.className='cs-row';
+ teamRow.innerHTML='<span>Team map</span><span id="csCovTeam">0%</span>';
+ var teamBar=document.createElement('div'); teamBar.className='cs-bar';
+ var teamFill=document.createElement('div'); teamFill.className='cs-fill'; teamFill.id='csBarTeam'; teamFill.style.background='#7F77DD';
+ teamBar.appendChild(teamFill);
+ coveragePanel.appendChild(teamRow);
+ coveragePanel.appendChild(teamBar);
+ var linkRow=document.createElement('div'); linkRow.className='cs-row'; linkRow.style.marginBottom='0';
+ linkRow.innerHTML='<span id="csLinks">Comm links: 0 active</span>';
+ coveragePanel.appendChild(linkRow);
+}
+
+function reset(){
+ var env=ENVIRONMENTS[parseInt(envSelect.value,10)||0];
+ ROWS=env.rows; COLS=env.cols; CELL=env.cell;
+ canvas.width=COLS*CELL; canvas.height=ROWS*CELL;
+ canvas.style.width=canvas.width+'px'; canvas.style.height=canvas.height+'px';
+ wallGrid=env.build(ROWS,COLS);
+ totalFree=countFree(wallGrid);
+ var n=Math.max(2,Math.min(8,parseInt(numDronesInput.value,10)||2));
+ numDronesInput.value=n;
+ var starts=pickStartPositions(wallGrid,n);
+ drones=starts.map(function(s,i){ return makeDrone(String.fromCharCode(65+i), DRONE_COLORS[i%DRONE_COLORS.length], s.r, s.c); });
+ phase='mapping';
+ goal=null;
+ running=true;
+ navUnlocked=false;
+ speedMul=parseFloat(speedInput.value)||1;
+ logs=[];
+ pairInRange={};
+ simTimeNs=0;
+ btnNav.disabled=true;
+ canvas.style.cursor='default';
+ btnPause.innerHTML='<i class="ti ti-player-pause" aria-hidden="true" style="font-size:16px;vertical-align:-3px;margin-right:4px"></i>Pause';
+ phaseEl.textContent='Mapping';
+ phaseEl.className='cs-badge';
+ hintEl.textContent='Drones are exploring independently and will share what they find when close enough.';
+ renderCoveragePanel();
+ pushLog('Mission started on "'+env.name+'" with '+n+' drone'+(n>1?'s':'')+'.');
+}
+
+function sense(d){
+ for(var i=0;i<RAYS;i++){
+  var ang=(Math.PI*2*i)/RAYS;
+  var dx=Math.cos(ang), dy=Math.sin(ang);
+  var maxDist=SENSOR_RANGE_CELLS*CELL, step=CELL*RAYSTEP_FRAC;
+  for(var dist=0;dist<=maxDist;dist+=step){
+   var x=d.x+dx*dist, y=d.y+dy*dist;
+   var r=Math.floor(y/CELL), c=Math.floor(x/CELL);
+   if(!inBounds(r,c)) break;
+   if(wallGrid[r][c]){ d.known[r][c]=1; break; }
+   d.known[r][c]=0;
+  }
+ }
+}
+
+function isFrontier(g,r,c){
+ if(g[r][c]!==0) return false;
+ var nb=[[r-1,c],[r+1,c],[r,c-1],[r,c+1]];
+ for(var i=0;i<nb.length;i++){
+  var nr=nb[i][0], nc=nb[i][1];
+  if(inBounds(nr,nc)&&g[nr][nc]===-1) return true;
+ }
+ return false;
+}
+
+function findFrontierPath(g,start,exclude){
+ var visited={}; var startKey=start.r+','+start.c;
+ visited[startKey]=true;
+ var queue=[{r:start.r,c:start.c,parent:null}];
+ var head=0;
+ while(head<queue.length){
+  var cur=queue[head++];
+  var key=cur.r+','+cur.c;
+  if(key!==startKey&&isFrontier(g,cur.r,cur.c)&&!exclude[key]){
+   var path=[]; var n=cur;
+   while(n){ path.unshift({r:n.r,c:n.c}); n=n.parent; }
+   path.shift();
+   return {target:{r:cur.r,c:cur.c},path:path};
+  }
+  var nb=[[cur.r-1,cur.c],[cur.r+1,cur.c],[cur.r,cur.c-1],[cur.r,cur.c+1]];
+  for(var i=0;i<nb.length;i++){
+   var nr=nb[i][0], nc=nb[i][1]; var nkey=nr+','+nc;
+   if(inBounds(nr,nc)&&g[nr][nc]!==1&&!visited[nkey]){
+    visited[nkey]=true;
+    queue.push({r:nr,c:nc,parent:cur});
+   }
+  }
+ }
+ return null;
+}
+
+function bfsFarthestReachable(g,start){
+ var visited={}; var startKey=start.r+','+start.c;
+ visited[startKey]=true;
+ var queue=[{r:start.r,c:start.c,parent:null,dist:0}]; var head=0; var farthest=null;
+ while(head<queue.length){
+  var cur=queue[head++];
+  if(cur.dist>0) farthest=cur;
+  var nb=[[cur.r-1,cur.c],[cur.r+1,cur.c],[cur.r,cur.c-1],[cur.r,cur.c+1]];
+  for(var i=0;i<nb.length;i++){
+   var nr=nb[i][0], nc=nb[i][1]; var nkey=nr+','+nc;
+   if(inBounds(nr,nc)&&g[nr][nc]===0&&!visited[nkey]){ visited[nkey]=true; queue.push({r:nr,c:nc,parent:cur,dist:cur.dist+1}); }
+  }
+ }
+ if(!farthest) return null;
+ var path=[]; var n=farthest; while(n){ path.unshift({r:n.r,c:n.c}); n=n.parent; } path.shift();
+ return path;
+}
+
+function bfsPath(g,start,goalCell){
+ if(start.r===goalCell.r&&start.c===goalCell.c) return [];
+ var visited={}; var startKey=start.r+','+start.c;
+ visited[startKey]=true;
+ var queue=[{r:start.r,c:start.c,parent:null}];
+ var head=0;
+ while(head<queue.length){
+  var cur=queue[head++];
+  if(cur.r===goalCell.r&&cur.c===goalCell.c){
+   var path=[]; var n=cur;
+   while(n){ path.unshift({r:n.r,c:n.c}); n=n.parent; }
+   path.shift();
+   return path;
+  }
+  var nb=[[cur.r-1,cur.c],[cur.r+1,cur.c],[cur.r,cur.c-1],[cur.r,cur.c+1]];
+  for(var i=0;i<nb.length;i++){
+   var nr=nb[i][0], nc=nb[i][1]; var nkey=nr+','+nc;
+   if(inBounds(nr,nc)&&g[nr][nc]===0&&!visited[nkey]){
+    visited[nkey]=true;
+    queue.push({r:nr,c:nc,parent:cur});
+   }
+  }
+ }
+ return null;
+}
+
+function liveMerged(){
+ var g=[];
+ for(var r=0;r<ROWS;r++){
+  var row=new Array(COLS);
+  for(var c=0;c<COLS;c++){
+   var occ=false, free=false;
+   for(var i=0;i<drones.length;i++){
+    var v=drones[i].known[r][c];
+    if(v===1) occ=true;
+    else if(v===0) free=true;
+   }
+   row[c]=occ?1:(free?0:-1);
+  }
+  g.push(row);
+ }
+ return g;
+}
+
+function mergePair(d1,d2){
+ for(var r=0;r<ROWS;r++){
+  for(var c=0;c<COLS;c++){
+   if(d1.known[r][c]===-1&&d2.known[r][c]!==-1) d1.known[r][c]=d2.known[r][c];
+   if(d2.known[r][c]===-1&&d1.known[r][c]!==-1) d2.known[r][c]=d1.known[r][c];
+  }
+ }
+}
+
+function mergeAll(){
+ for(var i=0;i<drones.length;i++){ for(var j=i+1;j<drones.length;j++){ mergePair(drones[i],drones[j]); } }
+}
+
+function planNext(d){
+ var exclude={};
+ drones.forEach(function(o){ if(o!==d&&o.targetKey) exclude[o.targetKey]=true; });
+ var res=findFrontierPath(d.known,{r:d.r,c:d.c},exclude);
+ if(!res) res=findFrontierPath(d.known,{r:d.r,c:d.c},{});
+ if(res){
+  d.path=res.path.map(function(p){ return cellCenter(p.r,p.c); });
+  d.targetKey=res.target.r+','+res.target.c;
+  d.wandering=false; d.wanderStrikes=0;
+  return;
+ }
+ d.targetKey=null;
+ d.wanderStrikes=(d.wanderStrikes||0)+1;
+ if(d.wanderStrikes>3){
+  if(d.state!=='done'){ pushLog('Drone '+d.id+' has mapped all of its reachable area.'); }
+  d.state='done';
+  return;
+ }
+ var wpath=bfsFarthestReachable(d.known,{r:d.r,c:d.c});
+ if(wpath&&wpath.length){
+  d.path=wpath.map(function(p){ return cellCenter(p.r,p.c); });
+  d.wandering=true;
+ } else {
+  d.state='done';
+ }
+}
+
+function onArrive(d){
+ if(phase==='navigate'){
+  d.state='idle';
+  if(!d.arrivedLogged){ pushLog('Drone '+d.id+' reached the target.'); d.arrivedLogged=true; }
+ } else {
+  d.targetKey=null;
+  d.wandering=false;
+ }
+}
+
+function moveAlong(d,dt){
+ if(!d.path.length) return;
+ var t=d.path[0];
+ var dx=t.x-d.x, dy=t.y-d.y;
+ var dist=Math.hypot(dx,dy);
+ var step=SPEED_CELLS_PER_SEC*CELL*dt;
+ if(dist<=step){
+  d.x=t.x; d.y=t.y; d.path.shift();
+  d.r=Math.floor(d.y/CELL); d.c=Math.floor(d.x/CELL);
+  if(!d.path.length) onArrive(d);
+ } else {
+  d.heading=Math.atan2(dy,dx);
+  d.x+=dx/dist*step; d.y+=dy/dist*step;
+  d.r=Math.floor(d.y/CELL); d.c=Math.floor(d.x/CELL);
+ }
+}
+
+function checkCommRange(){
+ var activeCount=0;
+ for(var i=0;i<drones.length;i++){
+  for(var j=i+1;j<drones.length;j++){
+   var d1=drones[i], d2=drones[j];
+   var key=i+'-'+j;
+   var dist=Math.hypot((d1.x-d2.x)/CELL,(d1.y-d2.y)/CELL);
+   var inRange=dist<=COMM_RANGE_CELLS;
+   if(inRange) activeCount++;
+   if(inRange&&!pairInRange[key]){
+    mergePair(d1,d2);
+    pushLog('Drones '+d1.id+' and '+d2.id+' are in range. Maps synchronized.');
+    queueMessage('/sim/team/comm/'+d1.id+'-'+d2.id, {distance:round2(dist),inRange:true});
+   } else if(!inRange&&pairInRange[key]){
+    queueMessage('/sim/team/comm/'+d1.id+'-'+d2.id, {distance:round2(dist),inRange:false});
+   }
+   pairInRange[key]=inRange;
+  }
+ }
+ var linksEl=document.getElementById('csLinks');
+ if(linksEl) linksEl.textContent='Comm links: '+activeCount+' active';
+}
+
+function coveragePct(known){
+ var n=0;
+ for(var r=0;r<ROWS;r++){ for(var c=0;c<COLS;c++){ if(known[r][c]===0) n++; } }
+ return Math.round((n/totalFree)*100);
+}
+
+function teamCoveragePct(){
+ var m=liveMerged(); var n=0;
+ for(var r=0;r<ROWS;r++){ for(var c=0;c<COLS;c++){ if(m[r][c]===0) n++; } }
+ return Math.round((n/totalFree)*100);
+}
+
+function round2(v){ return Math.round(v*100)/100; }
+function toMeters(px){ return round2(px/CELL*0.5); }
+
+function switchToNav(auto){
+ if(phase!=='mapping') return;
+ mergeAll();
+ phase='navigate';
+ phaseEl.textContent='Navigating';
+ phaseEl.className='cs-badge nav';
+ drones.forEach(function(d){ d.state='idle'; d.path=[]; d.targetKey=null; d.wandering=false; d.arrivedLogged=false; });
+ btnNav.disabled=true;
+ canvas.style.cursor='crosshair';
+ hintEl.textContent='Click an explored area of the map to send every drone there.';
+ pushLog(auto?'Mapping complete. Click the map to send drones to a target.':'Switched to navigation early. Final map sync complete.');
+}
+
+function updateCoverageUI(){
+ var ct=teamCoveragePct();
+ drones.forEach(function(d){
+  var pct=coveragePct(d.known);
+  var covEl=document.getElementById('csCov_'+d.id);
+  var barEl=document.getElementById('csBar_'+d.id);
+  if(covEl) covEl.textContent=pct+'%';
+  if(barEl) barEl.style.width=pct+'%';
+  if(pct!==d.lastCoveragePct){ d.lastCoveragePct=pct; queueMessage('/sim/drones/'+d.id+'/coverage', {pct:pct}); }
+ });
+ var teamCovEl=document.getElementById('csCovTeam');
+ var teamBarEl=document.getElementById('csBarTeam');
+ if(teamCovEl) teamCovEl.textContent=ct+'%';
+ if(teamBarEl) teamBarEl.style.width=ct+'%';
+ return ct;
+}
+
+function update(dt){
+ simTimeNs+=dt*1e9;
+ if(phase==='mapping'){
+  drones.forEach(sense);
+  checkCommRange();
+  drones.forEach(function(d){
+   if(d.state!=='exploring') return;
+   if(d.path.length){
+    var nextCell=d.path[0];
+    var nr=Math.floor(nextCell.y/CELL), nc=Math.floor(nextCell.x/CELL);
+    if(d.known[nr][nc]===1){ d.path=[]; d.targetKey=null; d.wandering=false; }
+   }
+   if(d.targetKey){
+    var parts=d.targetKey.split(','); var r=parseInt(parts[0],10), c=parseInt(parts[1],10);
+    if(!isFrontier(d.known,r,c)){ d.path=[]; d.targetKey=null; }
+   }
+   if(!d.path.length){ planNext(d); }
+  });
+  drones.forEach(function(d){ moveAlong(d,dt); });
+  var ct=updateCoverageUI();
+  if(!navUnlocked&&ct>=25){ navUnlocked=true; btnNav.disabled=false; }
+  if(drones.every(function(d){ return d.state==='done'; })){ switchToNav(true); }
+ } else {
+  drones.forEach(sense);
+  drones.forEach(function(d){ moveAlong(d,dt); });
+  updateCoverageUI();
+ }
+ if(simTimeNs-lastPoseLogNs>=1e8){
+  lastPoseLogNs=simTimeNs;
+  drones.forEach(function(d){
+   queueMessage('/sim/drones/'+d.id+'/pose', {x:toMeters(d.x),y:toMeters(d.y),heading:round2(d.heading),state:d.state});
+  });
+ }
+}
+
+function render(){
+ ctx.fillStyle='#0b0d12';
+ ctx.fillRect(0,0,canvas.width,canvas.height);
+ for(var r=0;r<ROWS;r++){
+  for(var c=0;c<COLS;c++){
+   var knownCount=0, occupied=false;
+   for(var i=0;i<drones.length;i++){
+    var v=drones[i].known[r][c];
+    if(v!==-1) knownCount++;
+    if(v===1) occupied=true;
+   }
+   if(knownCount===0) continue;
+   ctx.fillStyle=occupied?'#475569':'#101826';
+   ctx.fillRect(c*CELL,r*CELL,CELL,CELL);
+   if(!occupied){
+    ctx.fillStyle=knownCount>=2?'rgba(127,119,221,0.30)':'rgba(29,158,117,0.22)';
+    ctx.fillRect(c*CELL,r*CELL,CELL,CELL);
+   }
+  }
+ }
+ drones.forEach(function(d){
+  if(!d.path.length) return;
+  ctx.beginPath();
+  ctx.moveTo(d.x,d.y);
+  d.path.forEach(function(p){ ctx.lineTo(p.x,p.y); });
+  ctx.strokeStyle=d.color;
+  ctx.globalAlpha=0.5;
+  ctx.setLineDash([3,3]);
+  ctx.lineWidth=1.5;
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.globalAlpha=1;
+ });
+ for(var i=0;i<drones.length;i++){
+  for(var j=i+1;j<drones.length;j++){
+   var key=i+'-'+j;
+   if(!pairInRange[key]) continue;
+   var d1=drones[i], d2=drones[j];
+   ctx.beginPath();
+   ctx.moveTo(d1.x,d1.y);
+   ctx.lineTo(d2.x,d2.y);
+   ctx.strokeStyle='#2dd4bf';
+   ctx.lineWidth=2;
+   ctx.stroke();
+  }
+ }
+ if(goal){
+  var gp=cellCenter(goal.r,goal.c);
+  var pulse=3+2*Math.sin(Date.now()/200);
+  ctx.beginPath();
+  ctx.arc(gp.x,gp.y,9+pulse,0,Math.PI*2);
+  ctx.strokeStyle='#facc15';
+  ctx.lineWidth=2;
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(gp.x,gp.y,3,0,Math.PI*2);
+  ctx.fillStyle='#facc15';
+  ctx.fill();
+ }
+ drones.forEach(function(d){
+  ctx.save();
+  ctx.translate(d.x,d.y);
+  ctx.rotate(d.heading);
+  ctx.beginPath();
+  ctx.moveTo(8,0);
+  ctx.lineTo(-6,5);
+  ctx.lineTo(-6,-5);
+  ctx.closePath();
+  ctx.fillStyle=d.color;
+  ctx.fill();
+  ctx.restore();
+  ctx.fillStyle='#e5e7eb';
+  ctx.font='11px sans-serif';
+  ctx.textAlign='center';
+  ctx.fillText(d.id,d.x,d.y-12);
+ });
+}
+
+function frame(ts){
+ if(lastTime===null) lastTime=ts;
+ var dt=(ts-lastTime)/1000;
+ lastTime=ts;
+ if(running){ update(Math.min(dt,0.1)*speedMul); }
+ render();
+ requestAnimationFrame(frame);
+}
+
+canvas.addEventListener('click',function(e){
+ if(phase!=='navigate'){ pushLog('Navigation unlocks once mapping makes enough progress.'); return; }
+ var rect=canvas.getBoundingClientRect();
+ var scaleX=canvas.width/rect.width, scaleY=canvas.height/rect.height;
+ var x=(e.clientX-rect.left)*scaleX, y=(e.clientY-rect.top)*scaleY;
+ var c=Math.floor(x/CELL), r=Math.floor(y/CELL);
+ if(!inBounds(r,c)) return;
+ var merged=liveMerged();
+ if(merged[r][c]!==0){ pushLog('Pick an explored, open area of the map.'); return; }
+ goal={r:r,c:c};
+ queueMessage('/sim/goal', {x:toMeters(c*CELL+CELL/2), y:toMeters(r*CELL+CELL/2)});
+ var any=false;
+ drones.forEach(function(d){
+  var startCell={r:d.r,c:d.c};
+  var path=bfsPath(merged,startCell,{r:r,c:c});
+  if(path){
+   d.path=path.map(function(p){ return cellCenter(p.r,p.c); });
+   d.state='navigating';
+   d.arrivedLogged=false;
+   any=true;
+   if(!d.path.length) onArrive(d);
+  } else {
+   pushLog('Drone '+d.id+' has no known route to that point.');
+  }
+ });
+ if(any) pushLog('New target set. Drones are en route.');
+});
+
+btnPause.addEventListener('click',function(){
+ running=!running;
+ btnPause.innerHTML=running?'<i class="ti ti-player-pause" aria-hidden="true" style="font-size:16px;vertical-align:-3px;margin-right:4px"></i>Pause':'<i class="ti ti-player-play" aria-hidden="true" style="font-size:16px;vertical-align:-3px;margin-right:4px"></i>Resume';
+});
+btnReset.addEventListener('click',reset);
+btnNav.addEventListener('click',function(){ switchToNav(false); });
+speedInput.addEventListener('input',function(e){ speedMul=parseFloat(e.target.value); });
+numDronesInput.addEventListener('change',reset);
+envSelect.addEventListener('change',reset);
+
+function queueMessage(topic,obj){
+ if(!recording) return;
+ var item={topic:topic, t:Math.round(simTimeNs), obj:obj};
+ drainPromise=drainPromise.then(function(){ return writeOne(item); }).catch(function(err){ console.error('MCAP write error', err); });
+}
+async function writeOne(item){
+ var chId=channelIds[item.topic];
+ if(chId===undefined){
+  chId=await mcapWriter.registerChannel({schemaId:0, topic:item.topic, messageEncoding:'json', metadata:new Map()});
+  channelIds[item.topic]=chId;
+  seqCounters[item.topic]=0;
+ }
+ var bytes=new TextEncoder().encode(JSON.stringify(item.obj));
+ var t=BigInt(item.t);
+ await mcapWriter.addMessage({channelId:chId, sequence:seqCounters[item.topic]++, logTime:t, publishTime:t, data:bytes});
+}
+async function startRecording(){
+ try{
+  tempBuf=new TempBuffer();
+  mcapWriter=new McapWriter({writable:tempBuf, useStatistics:true, useChunks:true, useChunkIndex:true});
+  await mcapWriter.start({library:'cslam-sim', profile:''});
+  channelIds={}; seqCounters={}; drainPromise=Promise.resolve();
+  recording=true;
+  recBadge.style.display='inline-block';
+  btnRecord.innerHTML='<i class="ti ti-player-stop" aria-hidden="true" style="font-size:16px;vertical-align:-3px;margin-right:4px"></i>Stop recording';
+  pushLog('MCAP recording started.');
+ } catch(err){
+  console.error(err);
+  pushLog('Could not start recording (needs internet access to load @mcap/core).');
+ }
+}
+async function stopRecording(){
+ recording=false;
+ recBadge.style.display='none';
+ btnRecord.innerHTML='<i class="ti ti-player-record" aria-hidden="true" style="font-size:16px;vertical-align:-3px;margin-right:4px"></i>Record MCAP';
+ try{
+  await drainPromise;
+  await mcapWriter.end();
+  var bytes=tempBuf.get();
+  var blob=new Blob([bytes], {type:'application/octet-stream'});
+  var url=URL.createObjectURL(blob);
+  var a=document.createElement('a');
+  var stamp=new Date().toISOString().replace(/[:.]/g,'-');
+  a.href=url; a.download='cslam_sim_'+stamp+'.mcap';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  pushLog('Recording saved ('+bytes.length+' bytes).');
+ } catch(err){
+  console.error(err);
+  pushLog('Recording failed to finalize, see console.');
+ }
+}
+btnRecord.addEventListener('click',function(){
+ if(!recording){ startRecording(); } else { stopRecording(); }
+});
+
+lastTime=null;
+reset();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
