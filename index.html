@@ -61,7 +61,7 @@ input[type=number],select{background:var(--surface-2);color:var(--text-primary);
 <span class="cs-badge" id="csPhase">Mapping</span>
 <span class="cs-badge" id="csRecBadge" style="display:none">Recording</span>
 </div>
-<div style="margin-bottom:10px;font-size:12px;color:var(--text-muted)" id="csHint">Drones are exploring independently and will share what they find when close enough.</div>
+<div style="margin-bottom:10px;font-size:12px;color:var(--text-muted)" id="csHint">Drones explore with noisy sensors and drifting odometry, sharing maps when close enough. The hollow circle is each drone's true position; the triangle is where it believes it is.</div>
 <div class="cs-wrap">
 <div>
 <canvas id="csCanvas" style="display:block;border-radius:var(--radius);border:0.5px solid var(--border)"></canvas>
@@ -82,6 +82,7 @@ input[type=number],select{background:var(--surface-2);color:var(--text-primary);
 <div><i style="background:#7F77DD"></i>Shared (2+)</div>
 <div><i style="background:#475569"></i>Wall found</div>
 <div><i style="background:#facc15"></i>Target</div>
+<div><i style="background:transparent;border:1px solid #9aa5b8;border-radius:50%"></i>True position</div>
 </div>
 </div>
 </div>
@@ -135,6 +136,19 @@ var DRONE_COLORS=['#1D9E75','#D85A30','#7F77DD','#D4537E','#378ADD','#BA7517','#
 var SENSOR_RANGE_CELLS=4, RAYS=12, RAYSTEP_FRAC=0.25;
 var COMM_RANGE_CELLS=5;
 var SPEED_CELLS_PER_SEC=2.4;
+var RANGE_NOISE_CELLS=0.12, MISS_PROB=0.05, PHANTOM_PROB=0.02;
+var L_OCC=0.9, L_FREE=-0.35, L_CLAMP=5, WALL_LO=1.2, FREE_LO=-0.9;
+var DRIFT_BIAS_FRAC=0.012, DRIFT_NOISE_FRAC=0.02;
+var SCAN_MATCH_INTERVAL_NS=2e8, SCAN_MATCH_MIN_HITS=3, SCAN_MATCH_DAMP=0.5, SCAN_MATCH_MAX_STEP_CELLS=0.4, SCAN_MATCH_INLIER_CELLS=0.9, SCAN_MATCH_INLIER_FRAC=0.5;
+var UWB_NOISE_CELLS=0.05, UWB_DAMP=0.25, UWB_DEADBAND_CELLS=0.2;
+var WALL_STICKY_LO=2.5, WALL_STICKY_FACTOR=0.5;
+var FULL_COVERAGE_PCT=97, FULL_COVERAGE_HOLD_SEC=5;
+var STALL_REPLAN_SEC=1.5;
+
+var rngState=1;
+function seedRng(s){ rngState=(s>>>0)||0x9e3779b9; }
+function rng(){ rngState=(rngState+0x6D2B79F5)|0; var t=Math.imul(rngState^(rngState>>>15),1|rngState); t=(t+Math.imul(t^(t>>>7),61|t))^t; return ((t^(t>>>14))>>>0)/4294967296; }
+function gauss(){ var u=0,v=0; while(u===0)u=rng(); while(v===0)v=rng(); return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v); }
 
 var canvas=document.getElementById('csCanvas');
 var ctx=canvas.getContext('2d');
@@ -158,7 +172,7 @@ ENVIRONMENTS.forEach(function(env,i){
  envSelect.appendChild(opt);
 });
 
-var ROWS,COLS,CELL,wallGrid,totalFree,drones,phase,goal,running,navUnlocked,speedMul,logs,lastTime,pairInRange,simTimeNs;
+var ROWS,COLS,CELL,wallGrid,totalFree,drones,phase,goal,running,navUnlocked,speedMul,logs,lastTime,pairInRange,simTimeNs,fullCoverageSec;
 var recording=false, mcapWriter=null, tempBuf=null, channelIds=null, seqCounters=null, drainPromise=null, lastPoseLogNs=0;
 
 function inBounds(r,c){ return r>=0&&r<ROWS&&c>=0&&c<COLS; }
@@ -193,10 +207,22 @@ function pickStartPositions(g,n){
 }
 
 function makeKnown(){ var g=[]; for(var r=0;r<ROWS;r++){ g.push(new Array(COLS).fill(-1)); } return g; }
+function makeLogodds(){ var g=[]; for(var r=0;r<ROWS;r++){ g.push(new Array(COLS).fill(0)); } return g; }
+function classify(lo){ return lo>=WALL_LO?1:(lo<=FREE_LO?0:-1); }
+function addEvidence(d,r,c,delta){
+ var cur=d.logodds[r][c];
+ if(delta<0&&cur>=WALL_STICKY_LO) delta*=WALL_STICKY_FACTOR;
+ var lo=cur+delta;
+ if(lo>L_CLAMP) lo=L_CLAMP;
+ if(lo<-L_CLAMP) lo=-L_CLAMP;
+ d.logodds[r][c]=lo;
+ d.known[r][c]=classify(lo);
+}
 
 function makeDrone(id,color,r,c){
  var cc=cellCenter(r,c);
- return {id:id,color:color,r:r,c:c,x:cc.x,y:cc.y,heading:0,known:makeKnown(),path:[],state:'exploring',targetKey:null,wandering:false,wanderStrikes:0,arrivedLogged:false,lastCoveragePct:-1};
+ var biasAng=rng()*Math.PI*2;
+ return {id:id,color:color,r:r,c:c,x:cc.x,y:cc.y,tx:cc.x,ty:cc.y,heading:0,known:makeKnown(),logodds:makeLogodds(),driftBias:{x:Math.cos(biasAng)*DRIFT_BIAS_FRAC,y:Math.sin(biasAng)*DRIFT_BIAS_FRAC},lastMatchNs:0,stallSec:0,path:[],state:'exploring',targetKey:null,wandering:false,wanderStrikes:0,arrivedLogged:false,lastCoveragePct:-1};
 }
 
 function pushLog(text){
@@ -237,6 +263,7 @@ function renderCoveragePanel(){
 }
 
 function reset(){
+ seedRng((typeof window!=='undefined'&&window.CSLAM_SEED)||Date.now());
  var env=ENVIRONMENTS[parseInt(envSelect.value,10)||0];
  ROWS=env.rows; COLS=env.cols; CELL=env.cell;
  canvas.width=COLS*CELL; canvas.height=ROWS*CELL;
@@ -255,29 +282,98 @@ function reset(){
  logs=[];
  pairInRange={};
  simTimeNs=0;
+ fullCoverageSec=0;
  btnNav.disabled=true;
  canvas.style.cursor='default';
  btnPause.innerHTML='<i class="ti ti-player-pause" aria-hidden="true" style="font-size:16px;vertical-align:-3px;margin-right:4px"></i>Pause';
  phaseEl.textContent='Mapping';
  phaseEl.className='cs-badge';
- hintEl.textContent='Drones are exploring independently and will share what they find when close enough.';
+ hintEl.textContent='Drones explore with noisy sensors and drifting odometry, sharing maps when close enough. The hollow circle is each drone\'s true position; the triangle is where it believes it is.';
  renderCoveragePanel();
  pushLog('Mission started on "'+env.name+'" with '+n+' drone'+(n>1?'s':'')+'.');
 }
 
-function sense(d){
+function castScan(px,py){
+ var rays=[];
+ var maxDist=SENSOR_RANGE_CELLS*CELL, step=CELL*RAYSTEP_FRAC;
  for(var i=0;i<RAYS;i++){
   var ang=(Math.PI*2*i)/RAYS;
   var dx=Math.cos(ang), dy=Math.sin(ang);
-  var maxDist=SENSOR_RANGE_CELLS*CELL, step=CELL*RAYSTEP_FRAC;
+  var trueDist=maxDist, hit=false;
   for(var dist=0;dist<=maxDist;dist+=step){
-   var x=d.x+dx*dist, y=d.y+dy*dist;
-   var r=Math.floor(y/CELL), c=Math.floor(x/CELL);
-   if(!inBounds(r,c)) break;
-   if(wallGrid[r][c]){ d.known[r][c]=1; break; }
-   d.known[r][c]=0;
+   var r=Math.floor((py+dy*dist)/CELL), c=Math.floor((px+dx*dist)/CELL);
+   if(!inBounds(r,c)){ trueDist=dist; break; }
+   if(wallGrid[r][c]){ trueDist=dist; hit=true; break; }
   }
+  var measured=trueDist, reportHit=hit;
+  if(hit&&rng()<MISS_PROB){
+   reportHit=false; measured=maxDist;
+  } else if(hit){
+   measured=Math.max(0,Math.min(maxDist,trueDist+gauss()*RANGE_NOISE_CELLS*CELL));
+  } else if(rng()<PHANTOM_PROB){
+   reportHit=true; measured=rng()*trueDist;
+  }
+  rays.push({dx:dx,dy:dy,dist:measured,hit:reportHit});
  }
+ return rays;
+}
+
+function integrateScan(d,scan){
+ var step=CELL*RAYSTEP_FRAC;
+ var sr=Math.floor(d.y/CELL), sc=Math.floor(d.x/CELL);
+ if(inBounds(sr,sc)) addEvidence(d,sr,sc,L_FREE);
+ for(var i=0;i<scan.length;i++){
+  var ray=scan[i];
+  var hr=-1, hc=-1;
+  if(ray.hit){
+   var hd=ray.dist+CELL*RAYSTEP_FRAC*0.5;
+   hr=Math.floor((d.y+ray.dy*hd)/CELL); hc=Math.floor((d.x+ray.dx*hd)/CELL);
+  }
+  for(var dist=0;dist<ray.dist;dist+=step){
+   var r=Math.floor((d.y+ray.dy*dist)/CELL), c=Math.floor((d.x+ray.dx*dist)/CELL);
+   if(!inBounds(r,c)) break;
+   if(r===hr&&c===hc) continue;
+   var strongWall=d.logodds[r][c]>=WALL_STICKY_LO;
+   addEvidence(d,r,c,L_FREE);
+   if(strongWall) break;
+  }
+  if(ray.hit&&inBounds(hr,hc)) addEvidence(d,hr,hc,L_OCC);
+ }
+}
+
+function scanMatch(d,scan){
+ var maxDist=SENSOR_RANGE_CELLS*CELL, step=CELL*RAYSTEP_FRAC;
+ var sumX=0, sumY=0, n=0, nCand=0;
+ for(var i=0;i<scan.length;i++){
+  var ray=scan[i];
+  if(!ray.hit||ray.dist>=maxDist*0.98) continue;
+  var mapDist=-1;
+  for(var dist=0;dist<=maxDist+CELL;dist+=step){
+   var r=Math.floor((d.y+ray.dy*dist)/CELL), c=Math.floor((d.x+ray.dx*dist)/CELL);
+   if(!inBounds(r,c)) break;
+   if(d.logodds[r][c]>=WALL_LO){ mapDist=dist; break; }
+  }
+  if(mapDist<0) continue;
+  nCand++;
+  var res=mapDist-ray.dist;
+  if(Math.abs(res)>SCAN_MATCH_INLIER_CELLS*CELL) continue;
+  sumX+=res*ray.dx; sumY+=res*ray.dy; n++;
+ }
+ if(n<SCAN_MATCH_MIN_HITS||n<nCand*SCAN_MATCH_INLIER_FRAC) return;
+ var ox=sumX/n*SCAN_MATCH_DAMP*2, oy=sumY/n*SCAN_MATCH_DAMP*2;
+ var mag=Math.hypot(ox,oy);
+ var maxStep=SCAN_MATCH_MAX_STEP_CELLS*CELL;
+ if(mag>maxStep){ ox*=maxStep/mag; oy*=maxStep/mag; }
+ if(mag>0.001){
+  d.x+=ox; d.y+=oy;
+  d.r=Math.floor(d.y/CELL); d.c=Math.floor(d.x/CELL);
+ }
+}
+
+function sense(d){
+ var scan=castScan(d.tx,d.ty);
+ if(simTimeNs-d.lastMatchNs>=SCAN_MATCH_INTERVAL_NS){ d.lastMatchNs=simTimeNs; scanMatch(d,scan); }
+ integrateScan(d,scan);
 }
 
 function isFrontier(g,r,c){
@@ -365,13 +461,12 @@ function liveMerged(){
  for(var r=0;r<ROWS;r++){
   var row=new Array(COLS);
   for(var c=0;c<COLS;c++){
-   var occ=false, free=false;
+   var m=0;
    for(var i=0;i<drones.length;i++){
-    var v=drones[i].known[r][c];
-    if(v===1) occ=true;
-    else if(v===0) free=true;
+    var lo=drones[i].logodds[r][c];
+    if(Math.abs(lo)>Math.abs(m)) m=lo;
    }
-   row[c]=occ?1:(free?0:-1);
+   row[c]=classify(m);
   }
   g.push(row);
  }
@@ -381,8 +476,10 @@ function liveMerged(){
 function mergePair(d1,d2){
  for(var r=0;r<ROWS;r++){
   for(var c=0;c<COLS;c++){
-   if(d1.known[r][c]===-1&&d2.known[r][c]!==-1) d1.known[r][c]=d2.known[r][c];
-   if(d2.known[r][c]===-1&&d1.known[r][c]!==-1) d2.known[r][c]=d1.known[r][c];
+   var a=d1.logodds[r][c], b=d2.logodds[r][c];
+   var m=Math.abs(a)>=Math.abs(b)?a:b;
+   if(a!==m){ d1.logodds[r][c]=m; d1.known[r][c]=classify(m); }
+   if(b!==m){ d2.logodds[r][c]=m; d2.known[r][c]=classify(m); }
   }
  }
 }
@@ -403,8 +500,11 @@ function planNext(d){
   return;
  }
  d.targetKey=null;
+ var freeKnown=0;
+ for(var fr=0;fr<ROWS&&freeKnown<5;fr++){ for(var fc=0;fc<COLS;fc++){ if(d.known[fr][fc]===0) freeKnown++; } }
+ if(freeKnown<5) return;
  d.wanderStrikes=(d.wanderStrikes||0)+1;
- if(d.wanderStrikes>3){
+ if(d.wanderStrikes>5){
   if(d.state!=='done'){ pushLog('Drone '+d.id+' has mapped all of its reachable area.'); }
   d.state='done';
   return;
@@ -428,20 +528,51 @@ function onArrive(d){
  }
 }
 
+function blockedAt(px,py){
+ var r=Math.floor(py/CELL), c=Math.floor(px/CELL);
+ return !inBounds(r,c)||wallGrid[r][c];
+}
+
 function moveAlong(d,dt){
  if(!d.path.length) return;
  var t=d.path[0];
  var dx=t.x-d.x, dy=t.y-d.y;
  var dist=Math.hypot(dx,dy);
  var step=SPEED_CELLS_PER_SEC*CELL*dt;
- if(dist<=step){
-  d.x=t.x; d.y=t.y; d.path.shift();
-  d.r=Math.floor(d.y/CELL); d.c=Math.floor(d.x/CELL);
-  if(!d.path.length) onArrive(d);
+ var mx,my;
+ if(dist<=step){ mx=dx; my=dy; }
+ else { d.heading=Math.atan2(dy,dx); mx=dx/dist*step; my=dy/dist*step; }
+ var ntx=d.tx+mx, nty=d.ty+my;
+ if(blockedAt(ntx,nty)){
+  if(!blockedAt(d.tx+mx,d.ty)){ ntx=d.tx+mx; nty=d.ty; }
+  else if(!blockedAt(d.tx,d.ty+my)){ ntx=d.tx; nty=d.ty+my; }
+  else { ntx=d.tx; nty=d.ty; }
+ }
+ var adx=ntx-d.tx, ady=nty-d.ty;
+ d.tx=ntx; d.ty=nty;
+ var len=Math.hypot(adx,ady);
+ d.x+=adx+(d.driftBias.x+gauss()*DRIFT_NOISE_FRAC)*len;
+ d.y+=ady+(d.driftBias.y+gauss()*DRIFT_NOISE_FRAC)*len;
+ d.r=Math.floor(d.y/CELL); d.c=Math.floor(d.x/CELL);
+ if(len<step*0.25){
+  d.stallSec+=dt;
+  if(d.stallSec>STALL_REPLAN_SEC){
+   d.stallSec=0;
+   d.path=[]; d.targetKey=null; d.wandering=false;
+   if(phase==='navigate'){
+    d.navRetries=(d.navRetries||0)+1;
+    var p=goal&&d.navRetries<=3?bfsPath(liveMerged(),{r:d.r,c:d.c},goal):null;
+    if(p&&p.length){ d.path=p.map(function(pt){ return cellCenter(pt.r,pt.c); }); }
+    else { d.state='idle'; }
+   }
+   return;
+  }
  } else {
-  d.heading=Math.atan2(dy,dx);
-  d.x+=dx/dist*step; d.y+=dy/dist*step;
-  d.r=Math.floor(d.y/CELL); d.c=Math.floor(d.x/CELL);
+  d.stallSec=0;
+ }
+ if(Math.hypot(t.x-d.x,t.y-d.y)<=Math.max(step,CELL*0.2)){
+  d.path.shift();
+  if(!d.path.length) onArrive(d);
  }
 }
 
@@ -451,9 +582,23 @@ function checkCommRange(){
   for(var j=i+1;j<drones.length;j++){
    var d1=drones[i], d2=drones[j];
    var key=i+'-'+j;
-   var dist=Math.hypot((d1.x-d2.x)/CELL,(d1.y-d2.y)/CELL);
+   var dist=Math.hypot((d1.tx-d2.tx)/CELL,(d1.ty-d2.ty)/CELL);
    var inRange=dist<=COMM_RANGE_CELLS;
    if(inRange) activeCount++;
+   if(inRange){
+    var measured=dist+gauss()*UWB_NOISE_CELLS;
+    var bx=d1.x-d2.x, by=d1.y-d2.y;
+    var believedDist=Math.hypot(bx,by)/CELL;
+    var err=believedDist-measured;
+    if(Math.abs(err)>UWB_DEADBAND_CELLS&&believedDist>0.001){
+     var corr=err*CELL*UWB_DAMP/2;
+     var ux=bx/(believedDist*CELL), uy=by/(believedDist*CELL);
+     d1.x-=ux*corr; d1.y-=uy*corr;
+     d2.x+=ux*corr; d2.y+=uy*corr;
+     d1.r=Math.floor(d1.y/CELL); d1.c=Math.floor(d1.x/CELL);
+     d2.r=Math.floor(d2.y/CELL); d2.c=Math.floor(d2.x/CELL);
+    }
+   }
    if(inRange&&!pairInRange[key]){
     mergePair(d1,d2);
     pushLog('Drones '+d1.id+' and '+d2.id+' are in range. Maps synchronized.');
@@ -471,13 +616,13 @@ function checkCommRange(){
 function coveragePct(known){
  var n=0;
  for(var r=0;r<ROWS;r++){ for(var c=0;c<COLS;c++){ if(known[r][c]===0) n++; } }
- return Math.round((n/totalFree)*100);
+ return Math.min(100,Math.round((n/totalFree)*100));
 }
 
 function teamCoveragePct(){
  var m=liveMerged(); var n=0;
  for(var r=0;r<ROWS;r++){ for(var c=0;c<COLS;c++){ if(m[r][c]===0) n++; } }
- return Math.round((n/totalFree)*100);
+ return Math.min(100,Math.round((n/totalFree)*100));
 }
 
 function round2(v){ return Math.round(v*100)/100; }
@@ -489,7 +634,7 @@ function switchToNav(auto){
  phase='navigate';
  phaseEl.textContent='Navigating';
  phaseEl.className='cs-badge nav';
- drones.forEach(function(d){ d.state='idle'; d.path=[]; d.targetKey=null; d.wandering=false; d.arrivedLogged=false; });
+ drones.forEach(function(d){ d.state='idle'; d.path=[]; d.targetKey=null; d.wandering=false; d.arrivedLogged=false; d.navRetries=0; });
  btnNav.disabled=true;
  canvas.style.cursor='crosshair';
  hintEl.textContent='Click an explored area of the map to send every drone there.';
@@ -534,7 +679,8 @@ function update(dt){
   drones.forEach(function(d){ moveAlong(d,dt); });
   var ct=updateCoverageUI();
   if(!navUnlocked&&ct>=25){ navUnlocked=true; btnNav.disabled=false; }
-  if(drones.every(function(d){ return d.state==='done'; })){ switchToNav(true); }
+  if(ct>=FULL_COVERAGE_PCT){ fullCoverageSec+=dt; } else { fullCoverageSec=0; }
+  if(drones.every(function(d){ return d.state==='done'; })||fullCoverageSec>=FULL_COVERAGE_HOLD_SEC){ switchToNav(true); }
  } else {
   drones.forEach(sense);
   drones.forEach(function(d){ moveAlong(d,dt); });
@@ -543,7 +689,7 @@ function update(dt){
  if(simTimeNs-lastPoseLogNs>=1e8){
   lastPoseLogNs=simTimeNs;
   drones.forEach(function(d){
-   queueMessage('/sim/drones/'+d.id+'/pose', {x:toMeters(d.x),y:toMeters(d.y),heading:round2(d.heading),state:d.state});
+   queueMessage('/sim/drones/'+d.id+'/pose', {x:toMeters(d.x),y:toMeters(d.y),tx:toMeters(d.tx),ty:toMeters(d.ty),drift:round2(Math.hypot(d.x-d.tx,d.y-d.ty)/CELL*0.5),heading:round2(d.heading),state:d.state});
   });
  }
 }
@@ -553,17 +699,20 @@ function render(){
  ctx.fillRect(0,0,canvas.width,canvas.height);
  for(var r=0;r<ROWS;r++){
   for(var c=0;c<COLS;c++){
-   var knownCount=0, occupied=false;
+   var knownCount=0, occupied=false, conf=0;
    for(var i=0;i<drones.length;i++){
     var v=drones[i].known[r][c];
     if(v!==-1) knownCount++;
     if(v===1) occupied=true;
+    var a=Math.abs(drones[i].logodds[r][c]);
+    if(a>conf) conf=a;
    }
    if(knownCount===0) continue;
    ctx.fillStyle=occupied?'#475569':'#101826';
    ctx.fillRect(c*CELL,r*CELL,CELL,CELL);
    if(!occupied){
-    ctx.fillStyle=knownCount>=2?'rgba(127,119,221,0.30)':'rgba(29,158,117,0.22)';
+    var strength=Math.min(1,conf/L_CLAMP);
+    ctx.fillStyle=knownCount>=2?'rgba(127,119,221,'+(0.12+0.26*strength).toFixed(3)+')':'rgba(29,158,117,'+(0.08+0.20*strength).toFixed(3)+')';
     ctx.fillRect(c*CELL,r*CELL,CELL,CELL);
    }
   }
@@ -587,8 +736,8 @@ function render(){
    if(!pairInRange[key]) continue;
    var d1=drones[i], d2=drones[j];
    ctx.beginPath();
-   ctx.moveTo(d1.x,d1.y);
-   ctx.lineTo(d2.x,d2.y);
+   ctx.moveTo(d1.tx,d1.ty);
+   ctx.lineTo(d2.tx,d2.ty);
    ctx.strokeStyle='#2dd4bf';
    ctx.lineWidth=2;
    ctx.stroke();
@@ -607,6 +756,19 @@ function render(){
   ctx.fillStyle='#facc15';
   ctx.fill();
  }
+ drones.forEach(function(d){
+  ctx.globalAlpha=0.35;
+  ctx.strokeStyle=d.color;
+  ctx.lineWidth=1;
+  ctx.beginPath();
+  ctx.moveTo(d.x,d.y);
+  ctx.lineTo(d.tx,d.ty);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(d.tx,d.ty,4,0,Math.PI*2);
+  ctx.stroke();
+  ctx.globalAlpha=1;
+ });
  drones.forEach(function(d){
   ctx.save();
   ctx.translate(d.x,d.y);
@@ -654,6 +816,7 @@ canvas.addEventListener('click',function(e){
    d.path=path.map(function(p){ return cellCenter(p.r,p.c); });
    d.state='navigating';
    d.arrivedLogged=false;
+   d.navRetries=0;
    any=true;
    if(!d.path.length) onArrive(d);
   } else {

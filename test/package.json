@@ -1,0 +1,11 @@
+{
+  "name": "cslam-sim-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node run.mjs"
+  },
+  "dependencies": {
+    "jsdom": "^24.1.0"
+  }
+}

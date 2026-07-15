@@ -2,6 +2,42 @@
 
 All notable changes to the collaborative SLAM sim are logged here, newest first.
 
+## 2026-07-04 — v0.3: noisy sensing, odometry drift, scan matching, UWB correction
+
+This version removes the sim's three biggest cheats — perfect sensing, perfect localization, and ground-truth-only comm — turning it from a pathfinding demo into an actual SLAM illustration.
+
+**Added**
+- Probabilistic occupancy: each drone now builds a per-cell log-odds grid instead of a ternary known map. Sensor rays carry gaussian range noise (σ 0.12 cells), a 5% missed-wall rate, and 2% phantom returns; evidence accumulates and self-corrects. The ternary `known` grid still exists but is derived by thresholding log-odds, so the planners are unchanged. Free-cell rendering now shades by confidence.
+- Odometry drift: every drone tracks a *true* pose (used for physics: raycasts, wall collisions, comm range) and a *believed* pose (used for planning and as the map frame). Belief integrates actual displacement plus a per-drone constant bias (1.2% of distance, random direction) and gaussian noise (2%), so it drifts. A hollow circle + tether line renders the true pose next to the believed-pose triangle.
+- Scan matching: every 0.2 sim-seconds a drone compares each measured ray against the distance its own map predicts along that ray (beam model), rejects outlier rays (>0.9 cells residual, and requires a ≥50% inlier fraction), and applies a damped, capped correction to its believed pose. This bounds drift instead of eliminating it — corrections anchor to the drone's own map, which is itself imperfect.
+- UWB-style inter-drone ranging (matching the real system's UWB two-way ranging): while any pair is in comm range, the measured (true + noise) inter-drone distance nudges both believed poses toward consistency, running before map merge so merges inject less-offset geometry.
+- Committed test harness in `test/` (jsdom): extracts the real `<script>` from `index.html` and drives it headlessly — no more copy-paste logic extraction. Covers the 9-way coverage matrix, click-to-navigate, DOM lifecycle, and the record-button flow. `CSLAM_SEED` on `window` seeds the sim's RNG for deterministic runs; `SEED_BASE=<n> node run.mjs` re-rolls all noise.
+- Physical wall collisions: true motion is blocked by real walls (with axis slide); a drone whose believed pose disagrees with physics stalls, then replans (mapping) or retries the goal up to 3 times before idling (navigate).
+
+**Changed**
+- Map merge (pairwise sync and the team map) is now a max-confidence union of log-odds rather than a copy of ternary values — idempotent, so repeated merges don't double-count evidence.
+- `/sim/drones/<id>/pose` MCAP messages now include the true pose and drift: `{x, y, tx, ty, drift, heading, state}`.
+- Mapping also ends when team coverage holds ≥97% for 5 sim-seconds (in addition to every drone declaring done). With noisy sensors, frontier cells flicker forever near full coverage; a sustained-coverage cutoff is the standard exploration-mission answer, and it also cuts end-of-mission wandering, which was the main remaining drift exposure.
+- Wander fallback allows 5 strikes (was 3) before a drone declares done, since noise makes transient no-frontier states more common.
+- Comm range and comm-link rendering use true positions (physics), not believed ones.
+
+**Bugs found and fixed during this pass** (each found by the new matrix, worth recording since they're generic SLAM-sim traps)
+- *X-ray coverage*: a missed-wall ray reports max range, so free-space evidence was marked straight through walls, inflating coverage ~15% and ending missions early. Fix: the free-space march stops at cells the drone already believes are strong walls (map-consistent integration).
+- *Ghost walls hugging real walls*: range noise put ~⅓ of wall returns in the free cell in front of the wall; with any drift toward the wall this majority-votes a parallel ghost wall into the map, which then anchors scan matching to the drifted frame (sealing the 1-cell four-rooms doorways — 60% coverage stalls). Fix: bias the occupied-evidence cell half a ray-step into the wall; the return is from the surface, the occupied volume is behind it.
+- *One-way ICP pull*: the first scan-matcher (point-to-nearest-wall-cell-rectangle) only ever pulled hits toward walls, so with asymmetric wall views the believed pose migrated until the whole frame locked in a stable multi-cell offset. Fix: beam-model residuals (map-predicted minus measured distance along each ray) are signed, so too-deep hits push back.
+- *Aliasing runaway in the warehouse*: the regular block grid means a drifted drone's rays can hit one block physically but a different block in its map; clamping those huge residuals still let them vote, dragging belief away at the full correction rate (drift 4.5→8.9 cells in 20 sim-seconds). Fix: reject outlier rays entirely (classic ICP outlier gating) rather than clamping them.
+- *End-game drift ladder*: after ~97% coverage, drones wandered the whole map chasing noise-flicker frontiers, re-anchoring their matcher to merged map patches written by other drones at slightly different offsets — stacking up to ~4 cells of drift in the final stretch. Fixed by the sustained-coverage mapping cutoff above.
+
+**Known limitations / things to watch**
+- Scan matching is translation-only (no heading error is modeled) and anchors to the drone's own imperfect map: absolute drift is bounded (sub-cell typically, ~2 cells worst-case per the matrix), not eliminated. There is no loop closure or retroactive map correction — that's the part of real graph-SLAM this sim still doesn't model.
+- Merged maps combine per-drone frames that each carry residual drift, so slight double-wall smear near cell boundaries is expected and honest; occasionally a believed-free cell is unreachable in the merged map and drones will report "no known route".
+- Coverage tops out at 97–100% rather than a guaranteed 100%: a few cells stay unknown behind residual believed walls. The matrix asserts ≥95%.
+- The rendering changes (ghost markers, confidence shading) ran only against the harness's stub canvas; a live-browser visual pass wasn't possible from this sandbox. Logic and DOM behavior are covered by the suite.
+
+**Verification**
+- `cd test && npm install && node run.mjs` — 43 checks: the 9-way matrix (3 environments × 2/4/8 drones) asserting mapping completes, team coverage ≥95%, and max residual drift <3 cells; click-to-navigate arrival; DOM lifecycle (drone-count/env switches, pause, reset); record-button flow with a stub MCAP writer.
+- The full suite was run under four different seed bases (1000/3000/5000/9000 via `SEED_BASE`) — all 43 checks pass under every seed set, so the tuning isn't overfit to one noise roll.
+
 ## 2026-07-03 — v0.2: N drones, environment switcher, MCAP recording
 
 **Added**
